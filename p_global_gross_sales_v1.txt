@@ -1,0 +1,189 @@
+CREATE PROC p_global_gross_sales_v1
+as
+  
+/***************************************************************************
+IBP Planning Customer to ZBFS ARC conversion
+***************************************************************************/
+select 
+a.KEYFIGUREDATE as gross_sales_dte,
+year(a.KEYFIGUREDATE) as gross_sales_year_nbr,
+month(a.KEYFIGUREDATE) as gross_sales_month_nbr,
+a.PRDID as alt_item, 
+a.CUSTID as plan_cust,
+a.DEMANDSTREAMID as fcst_demand_type_cde, 
+a.DEMANDHISTORYQTY as gross_sales_qty, 
+r.area_id,
+r.region_id,
+r.country_id 
+into #temp_ibp
+from infoware.dbo.fcst_gross_sales_ibp a, forecast.dbo.iso_arc_conversion r
+where left(a.CUSTID,2) =r.iso_cde and r.source_cde='FS'
+
+/****************************************************************************
+Item Conversion - from IBP item number to JDE 2nd Item
+****************************************************************************/
+select 
+r.gross_sales_dte,
+r.gross_sales_year_nbr,
+r.gross_sales_month_nbr,
+r.alt_item,
+j.long_item_nbr as prod_id,
+r.plan_cust,
+r.fcst_demand_type_cde, 
+r.gross_sales_qty, 
+r.area_id,
+r.region_id,
+r.country_id 
+into #temp_ibp1
+from #temp_ibp r , infoware.dbo.jde_item_xref j
+where r.alt_item = j.long_item_nbr
+
+/****************************************************************************
+Spine ARC Conversion
+****************************************************************************/
+update #temp_ibp1 set area_id='6500' where  area_id='7000' and prod_id in (select prod_id from infoware.dbo.product_hierarchy 
+where business_segment_des In ('Spine','SPINE')) 
+
+update #temp_ibp1 set area_id='6500', region_id='0120' where area_id='7070' and prod_id in (select prod_id from infoware.dbo.product_hierarchy 
+where business_segment_des In ('Spine','SPINE')) 
+
+/****************************************************************************
+Items Exception - Capture
+****************************************************************************/
+truncate table ibp_item_exception
+
+insert into 
+ibp_item_exception
+select * from #temp_ibp1
+where prod_id is null
+
+/****************************************************************************
+Remove exception items from staging table
+****************************************************************************/
+delete from #temp_ibp1
+where prod_id is null
+
+/****************************************************************************
+UOM Conversion
+****************************************************************************/
+update #temp_ibp1 
+set #temp_ibp1.gross_sales_qty = round ((#temp_ibp1.gross_sales_qty/infoware.dbo.fcst_gross_sales_uom.UOM_QUANTITY),0)
+from #temp_ibp1, infoware.dbo.fcst_gross_sales_uom 
+where #temp_ibp1.alt_item = infoware.dbo.fcst_gross_sales_uom.GBMDMITEM
+and infoware.dbo.fcst_gross_sales_uom.PRIMARY_INDI='Y'
+
+/****************************************************************************
+Remove Aggregate/PAN records from Fcst_Gross_Sales
+****************************************************************************/
+delete from fcst_gross_sales
+where country_id in ('0000', 'C078','C130','C150')
+
+/****************************************************************************
+Insert IBP sales into gross sales table 
+****************************************************************************/
+select distinct area_id 
+into #temp_ibp_area
+from #temp_ibp1 
+
+select distinct area_id , region_id, country_id, fcst_demand_type_cde, prod_id 
+into #temp_del
+from fcst_gross_sales where area_id in (select * from #temp_ibp_area)
+
+delete from #temp_ibp1
+from #temp_ibp1 a, #temp_del r
+where a.area_id = r.area_id 
+and a.region_id = r.region_id
+and a.country_id = r.country_id
+and a.fcst_demand_type_cde = r.fcst_demand_type_cde
+and a.prod_id = r.prod_id
+
+insert into fcst_gross_sales
+select 
+r.area_id,
+r.region_id,
+r.country_id,
+r.fcst_demand_type_cde, 
+r.prod_id,
+r.gross_sales_dte,
+r.gross_sales_year_nbr,
+r.gross_sales_month_nbr,
+r.gross_sales_qty,
+getdate() as etl_load_dte 
+from #temp_ibp1 r
+
+/****************************************************************************
+Add Aggregate records to Fcst_Gross_Sales
+****************************************************************************/
+/*  Create Aggregate rows and add to temp table */
+	 
+	 select 
+     a.area_id
+	 ,a.region_id
+	 ,'0000' as country_id
+	 ,a.prod_id
+	 ,a.fcst_demand_type_cde
+	 ,a.gross_sales_dte
+	 ,a.gross_sales_year_nbr
+	 ,a.gross_sales_month_nbr
+	 ,sum(a.gross_sales_qty) as gross_sales_qty
+	 ,getdate() as etl_load_dte
+into #temp_aggr    
+from  infoware.dbo.fcst_gross_sales a
+	group by a.area_id
+	 ,a.region_id
+	 ,a.prod_id
+	 ,a.fcst_demand_type_cde
+	 ,a.gross_sales_dte
+	 ,a.gross_sales_year_nbr
+	 ,a.gross_sales_month_nbr
+
+/*  Insert Aggregate Rows to IBP table */	 
+insert into infoware.dbo.fcst_gross_sales
+select * from #temp_aggr
+	 
+/****************************************************************************
+Add PAN records to Fcst_Gross_Sales
+****************************************************************************/
+/*  Capture aggregate rows for EMEA and Latam and add to temp table */
+	 
+	 select 
+     a.area_id
+	 ,a.region_id
+	 ,'0000' as country_id
+	 ,a.prod_id
+	 ,a.fcst_demand_type_cde
+	 ,a.gross_sales_dte
+	 ,a.gross_sales_year_nbr
+	 ,a.gross_sales_month_nbr
+	 ,sum(a.gross_sales_qty) as gross_sales_qty
+	 ,getdate() as etl_load_dte
+into #temp_pan
+from  infoware.dbo.fcst_gross_sales a
+where a.area_id in ('7020','7070') 
+and region_id in ('0700','L130','L150') 
+and country_id ='0000'
+	group by a.area_id
+	 ,a.region_id
+	 ,a.prod_id
+	 ,a.fcst_demand_type_cde
+	 ,a.gross_sales_dte
+	 ,a.gross_sales_year_nbr
+	 ,a.gross_sales_month_nbr
+
+update #temp_pan set country_id ='C078'
+where area_id='7020'
+
+update #temp_pan set country_id ='C130'
+where area_id='7070' and region_id='L130'
+
+update #temp_pan set country_id ='C150'
+where area_id='7070' and region_id='L150'
+
+/*  Insert Aggregate Rows to IBP table */	 
+insert into infoware.dbo.fcst_gross_sales
+select * from #temp_pan
+
+/***********************************************************************/
+
+
+
